@@ -699,10 +699,11 @@ func (p *Platform) handleGroupMessage(data json.RawMessage) {
 	// Strip leading @bot mention (the official API includes it as content prefix)
 	content := stripAtMention(d.Content)
 
-	// Download image attachments
+	// Download image and audio attachments
 	images := downloadAttachmentImages(d.Attachments)
+	audio := downloadAttachmentAudio(d.Attachments)
 
-	if content == "" && len(images) == 0 {
+	if content == "" && len(images) == 0 && audio == nil {
 		return
 	}
 
@@ -728,10 +729,11 @@ func (p *Platform) handleGroupMessage(data json.RawMessage) {
 		UserName:   d.Author.MemberOpenID, // official API only provides openid, no nickname
 		Content:    content,
 		Images:     images,
+		Audio:      audio,
 		ReplyCtx:   rctx,
 	}
 
-	slog.Debug("qqbot: group message received", "group", d.GroupOpenID, "user", d.Author.MemberOpenID, "len", len(content), "images", len(images))
+	slog.Debug("qqbot: group message received", "group", d.GroupOpenID, "user", d.Author.MemberOpenID, "len", len(content), "images", len(images), "has_audio", audio != nil)
 	p.handler(p, msg)
 }
 
@@ -773,10 +775,11 @@ func (p *Platform) handleC2CMessage(data json.RawMessage) {
 
 	content := strings.TrimSpace(d.Content)
 
-	// Download image attachments
+	// Download image and audio attachments
 	images := downloadAttachmentImages(d.Attachments)
+	audio := downloadAttachmentAudio(d.Attachments)
 
-	if content == "" && len(images) == 0 {
+	if content == "" && len(images) == 0 && audio == nil {
 		return
 	}
 
@@ -796,10 +799,11 @@ func (p *Platform) handleC2CMessage(data json.RawMessage) {
 		UserName:   d.Author.UserOpenID,
 		Content:    content,
 		Images:     images,
+		Audio:      audio,
 		ReplyCtx:   rctx,
 	}
 
-	slog.Debug("qqbot: c2c message received", "user", d.Author.UserOpenID, "len", len(content), "images", len(images))
+	slog.Debug("qqbot: c2c message received", "user", d.Author.UserOpenID, "len", len(content), "images", len(images), "has_audio", audio != nil)
 	p.handler(p, msg)
 }
 
@@ -975,6 +979,47 @@ func downloadAttachmentImages(attachments []attachment) []core.ImageAttachment {
 		})
 	}
 	return images
+}
+
+// downloadAttachmentAudio finds the first audio attachment, downloads it and
+// returns an AudioAttachment ready for speech-to-text processing.
+func downloadAttachmentAudio(attachments []attachment) *core.AudioAttachment {
+	for _, att := range attachments {
+		if !strings.HasPrefix(att.ContentType, "audio/") {
+			continue
+		}
+		url := att.URL
+		if url == "" {
+			continue
+		}
+		if !strings.HasPrefix(url, "http") {
+			url = "https://" + url
+		}
+		resp, err := core.HTTPClient.Get(url)
+		if err != nil {
+			slog.Warn("qqbot: download audio failed", "url", url, "error", err)
+			continue
+		}
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			slog.Warn("qqbot: read audio body failed", "error", err)
+			continue
+		}
+
+		// Detect format from content-type
+		format := "mp3"
+		if parts := strings.SplitN(att.ContentType, "/", 2); len(parts) == 2 {
+			format = parts[1]
+		}
+
+		return &core.AudioAttachment{
+			MimeType: att.ContentType,
+			Data:     data,
+			Format:   format,
+		}
+	}
+	return nil
 }
 
 // stripAtMention removes the leading @bot mention from group message content.
