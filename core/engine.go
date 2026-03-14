@@ -2684,6 +2684,12 @@ func (e *Engine) cmdUsage(p Platform, msg *Message) {
 		return
 	}
 
+	// If the agent provides pre-formatted text, use it directly.
+	if report.FormattedText != "" {
+		e.reply(p, msg.ReplyCtx, report.FormattedText)
+		return
+	}
+
 	if supportsCards(p) {
 		e.replyWithCard(p, msg.ReplyCtx, e.renderUsageCard(report))
 		return

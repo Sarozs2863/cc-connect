@@ -460,21 +460,42 @@ func (a *Agent) GetUsage(_ context.Context) (*core.UsageReport, error) {
 		model = a.model
 	}
 
+	// Build progress bar (20 chars wide).
+	filled := usedPercent / 5
+	if filled > 20 {
+		filled = 20
+	}
+	bar := ""
+	for i := 0; i < 20; i++ {
+		if i < filled {
+			bar += "█"
+		} else {
+			bar += "░"
+		}
+	}
+
+	text := fmt.Sprintf("📊 会话用量\n\n上下文: %s / %s tokens (%d%%)\n%s\n\n费用: $%.2f\n模型: %s",
+		formatTokens(totalUsed), formatTokens(su.ContextWindow), usedPercent,
+		bar,
+		su.TotalCostUSD,
+		model,
+	)
+
 	return &core.UsageReport{
-		Provider: "Claude Code",
-		Buckets: []core.UsageBucket{{
-			Name:    "Context Window",
-			Allowed: true,
-			Windows: []core.UsageWindow{{
-				Name:        model,
-				UsedPercent: usedPercent,
-			}},
-		}},
-		Credits: &core.UsageCredits{
-			HasCredits: true,
-			Balance:    fmt.Sprintf("$%.2f", su.TotalCostUSD),
-		},
+		Provider:      "Claude Code",
+		FormattedText: text,
 	}, nil
+}
+
+// formatTokens formats a token count with K/M suffix for readability.
+func formatTokens(n int) string {
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.0fM", float64(n)/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1_000)
+	}
+	return fmt.Sprintf("%d", n)
 }
 
 func (a *Agent) Stop() error { return nil }

@@ -235,7 +235,8 @@ type UsageReport struct {
 	Email     string
 	Plan      string
 	Buckets   []UsageBucket
-	Credits   *UsageCredits
+	Credits       *UsageCredits
+	FormattedText string // If non-empty, cmdUsage outputs this directly instead of formatUsageReport.
 }
 
 // UsageBucket groups one logical quota, such as standard requests or code review.
