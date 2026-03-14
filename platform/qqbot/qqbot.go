@@ -55,6 +55,7 @@ type Platform struct {
 	sandbox               bool
 	allowFrom             string
 	shareSessionInChannel bool
+	markdown              bool
 	intents               int
 	handler               core.MessageHandler
 	cancel                context.CancelFunc
@@ -109,6 +110,7 @@ func New(opts map[string]any) (core.Platform, error) {
 	sandbox, _ := opts["sandbox"].(bool)
 	allowFrom, _ := opts["allow_from"].(string)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
+	markdown, _ := opts["markdown"].(bool)
 
 	intents := defaultIntents
 	if v, ok := opts["intents"].(int); ok && v > 0 {
@@ -124,6 +126,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		sandbox:               sandbox,
 		allowFrom:             allowFrom,
 		shareSessionInChannel: shareSessionInChannel,
+		markdown:              markdown,
 		intents:               intents,
 	}, nil
 }
@@ -822,9 +825,19 @@ func (p *Platform) sendMessage(rctx *replyContext, content string) error {
 		return fmt.Errorf("qqbot: unknown message type %q", rctx.messageType)
 	}
 
-	body := map[string]any{
-		"content":  content,
-		"msg_type": 0, // text
+	var body map[string]any
+	if p.markdown {
+		body = map[string]any{
+			"msg_type": 2,
+			"markdown": map[string]string{
+				"content": content,
+			},
+		}
+	} else {
+		body = map[string]any{
+			"content":  content,
+			"msg_type": 0,
+		}
 	}
 
 	// Include msg_id for passive reply if available
