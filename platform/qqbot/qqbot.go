@@ -937,9 +937,11 @@ func (p *Platform) apiRequest(method, url string, body any) error {
 
 // attachment represents an image/file attachment in the QQ Bot API event payload.
 type attachment struct {
-	ContentType string `json:"content_type"`
+	ContentType string `json:"content_type"` // "image/jpeg", "voice", "file", "video/mp4", etc.
 	URL         string `json:"url"`
 	Filename    string `json:"filename"`
+	VoiceWavURL string `json:"voice_wav_url"` // WAV format voice link (QQ specific)
+	ASRText     string `json:"asr_refer_text"` // QQ built-in ASR result
 }
 
 // downloadAttachmentImages downloads all image attachments and returns ImageAttachments.
@@ -981,20 +983,30 @@ func downloadAttachmentImages(attachments []attachment) []core.ImageAttachment {
 	return images
 }
 
-// downloadAttachmentAudio finds the first audio attachment, downloads it and
+// downloadAttachmentAudio finds the first voice attachment, downloads it and
 // returns an AudioAttachment ready for speech-to-text processing.
+// QQ Bot API uses content_type "voice" (not "audio/"), and provides
+// voice_wav_url (WAV format) alongside the original URL.
 func downloadAttachmentAudio(attachments []attachment) *core.AudioAttachment {
 	for _, att := range attachments {
-		if !strings.HasPrefix(att.ContentType, "audio/") {
+		if att.ContentType != "voice" {
 			continue
 		}
-		url := att.URL
+
+		// Prefer WAV URL, fall back to original URL
+		url := att.VoiceWavURL
+		format := "wav"
+		if url == "" {
+			url = att.URL
+			format = "silk"
+		}
 		if url == "" {
 			continue
 		}
 		if !strings.HasPrefix(url, "http") {
 			url = "https://" + url
 		}
+
 		resp, err := core.HTTPClient.Get(url)
 		if err != nil {
 			slog.Warn("qqbot: download audio failed", "url", url, "error", err)
@@ -1007,14 +1019,8 @@ func downloadAttachmentAudio(attachments []attachment) *core.AudioAttachment {
 			continue
 		}
 
-		// Detect format from content-type
-		format := "mp3"
-		if parts := strings.SplitN(att.ContentType, "/", 2); len(parts) == 2 {
-			format = parts[1]
-		}
-
 		return &core.AudioAttachment{
-			MimeType: att.ContentType,
+			MimeType: "audio/" + format,
 			Data:     data,
 			Format:   format,
 		}
