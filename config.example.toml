@@ -122,6 +122,36 @@ level = "info" # debug, info, warn, error
 #   #   -d "{\"session_key\":\"telegram:123:123\",\"event\":\"git:commit\",\"prompt\":\"New commit: $MSG. Review it briefly.\"}"
 
 # =============================================================================
+# Bridge Platform (External Adapters via WebSocket)
+# Bridge 平台（通过 WebSocket 接入外部适配器）
+# =============================================================================
+# Allow external adapters written in any language to connect at runtime.
+# 允许使用任何语言编写的外部适配器在运行时动态接入。
+# See docs/bridge-protocol.md for the full protocol specification.
+# 完整协议规范请参阅 docs/bridge-protocol.md。
+#
+# [bridge]
+# enabled = true
+# port = 9810                         # WebSocket listen port (default: 9810) / 监听端口
+# token = "your-bridge-secret"        # Auth token (required) / 认证密钥（必填）
+# path = "/bridge/ws"                 # URL path (default: "/bridge/ws") / URL 路径
+
+# =============================================================================
+# Management API (External Management Tools)
+# 管理 API（外部管理工具）
+# =============================================================================
+# HTTP REST API for external apps (web dashboards, TUI, GUI, Mac tray apps).
+# 为外部应用（Web 管理面板、TUI、GUI、Mac 托盘应用）提供 HTTP REST API。
+# See docs/management-api.md for the full API specification.
+# 完整 API 规范请参阅 docs/management-api.md。
+#
+# [management]
+# enabled = true
+# port = 9820                           # HTTP listen port (default: 9820) / 监听端口
+# token = "your-mgmt-secret"            # Auth token (required) / 认证密钥（必填）
+# cors_origins = ["http://localhost:3000"]  # Allowed CORS origins / 允许的 CORS 来源
+
+# =============================================================================
 # Speech-to-Text (Voice Messages) / 语音转文字（语音消息）
 # =============================================================================
 # Enable to transcribe voice messages to text before sending to agents.
@@ -166,7 +196,7 @@ level = "info" # debug, info, warn, error
 
 # [tts]
 # enabled  = true
-# provider = "qwen"          # "qwen" | "openai"
+# provider = "qwen"          # "qwen" | "openai" | "minimax"
 # voice    = "Cherry"        # default voice / 默认音色（千问支持：Cherry/Serena/Ethan/Chelsie 等）
 # tts_mode = "voice_only"    # "voice_only" (default) | "always"
 # max_text_len = 0           # max rune count before skipping TTS; 0 = no limit
@@ -186,6 +216,14 @@ level = "info" # debug, info, warn, error
 # api_key  = "sk-xxx"
 # base_url = ""              # optional: custom endpoint / 可选：自定义端点
 # model    = "tts-1"         # "tts-1" | "tts-1-hd"
+#
+# # Alternative: MiniMax TTS (T2A v2 streaming API)
+# # 备选：MiniMax TTS（T2A v2 流式 API）
+# # Docs: https://platform.minimaxi.com/document/T2A%20V2
+# [tts.minimax]
+# api_key  = "your-minimax-api-key"
+# base_url = ""              # optional: default "https://api.minimax.io" / 留空使用默认地址
+# model    = "speech-2.8-hd" # "speech-2.8-hd" | "speech-2.8"
 
 # =============================================================================
 # Daemon Mode / 守护进程模式
@@ -471,6 +509,17 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "bypassPermission
 # api_key = "sk-xxx"
 # base_url = "https://api.siliconflow.cn"
 # model = "deepseek-ai/DeepSeek-V3"
+# thinking = "disabled"
+#
+# # MiniMax — OpenAI-compatible provider with 204K context window
+# # MiniMax — 兼容 OpenAI 接口的大模型，支持 204K 超长上下文
+# # Models: MiniMax-M2.5 (flagship), MiniMax-M2.5-highspeed (faster)
+# # Docs: https://platform.minimaxi.com
+# [[projects.agent.providers]]
+# name = "minimax"
+# api_key = "your-minimax-api-key"
+# base_url = "https://api.minimax.io/v1"
+# model = "MiniMax-M2.5"
 # thinking = "disabled"
 #
 # # For special setups (Bedrock, Vertex, etc.), use the env map:
@@ -794,6 +843,14 @@ app_secret = "your-feishu-app-secret"
 # api_key = "sk-xxx"
 # base_url = "https://custom-api.com/v1"
 # model = "gpt-4o"
+#
+# # MiniMax — OpenAI-compatible, works natively with Codex
+# # MiniMax — 兼容 OpenAI 接口，可直接用于 Codex
+# [[projects.agent.providers]]
+# name = "minimax"
+# api_key = "your-minimax-api-key"
+# base_url = "https://api.minimax.io/v1"
+# model = "MiniMax-M2.5"
 #
 # [[projects.platforms]]
 # type = "telegram"
