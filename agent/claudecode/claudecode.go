@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -47,6 +48,8 @@ type Agent struct {
 	proxyLocalURL string              // local URL of the proxy
 
 	mu sync.Mutex
+
+	usageStore atomic.Value // stores *sessionUsage — latest usage from any session
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -222,7 +225,12 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	a.mu.Unlock()
 
-	return newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, extraEnv)
+	cs, err := newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, extraEnv)
+	if err != nil {
+		return nil, err
+	}
+	cs.usageStore = &a.usageStore
+	return cs, nil
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {
@@ -430,6 +438,43 @@ func extractTextContent(raw json.RawMessage) string {
 		}
 	}
 	return ""
+}
+
+// GetUsage implements core.UsageReporter for the /usage command.
+func (a *Agent) GetUsage(_ context.Context) (*core.UsageReport, error) {
+	v := a.usageStore.Load()
+	if v == nil {
+		return nil, fmt.Errorf("no usage data yet — send a message first")
+	}
+	su := v.(*sessionUsage)
+
+	totalInput := su.InputTokens + su.CacheCreationTokens + su.CacheReadTokens
+	totalUsed := totalInput + su.OutputTokens
+	usedPercent := 0
+	if su.ContextWindow > 0 {
+		usedPercent = totalUsed * 100 / su.ContextWindow
+	}
+
+	model := su.Model
+	if model == "" {
+		model = a.model
+	}
+
+	return &core.UsageReport{
+		Provider: "Claude Code",
+		Buckets: []core.UsageBucket{{
+			Name:    "Context Window",
+			Allowed: true,
+			Windows: []core.UsageWindow{{
+				Name:        model,
+				UsedPercent: usedPercent,
+			}},
+		}},
+		Credits: &core.UsageCredits{
+			HasCredits: true,
+			Balance:    fmt.Sprintf("$%.2f", su.TotalCostUSD),
+		},
+	}, nil
 }
 
 func (a *Agent) Stop() error { return nil }

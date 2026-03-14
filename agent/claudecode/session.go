@@ -25,6 +25,17 @@ import (
 //
 // In "auto" mode, permission requests are auto-approved internally
 // (avoiding --dangerously-skip-permissions which fails under root).
+// sessionUsage holds the latest usage snapshot from a Claude Code result event.
+type sessionUsage struct {
+	InputTokens         int
+	CacheCreationTokens int
+	CacheReadTokens     int
+	OutputTokens        int
+	TotalCostUSD        float64
+	ContextWindow       int
+	Model               string
+}
+
 type claudeSession struct {
 	cmd         *exec.Cmd
 	stdin       io.WriteCloser
@@ -37,6 +48,8 @@ type claudeSession struct {
 	cancel      context.CancelFunc
 	done        chan struct{}
 	alive       atomic.Bool
+	lastUsage   atomic.Value // stores *sessionUsage
+	usageStore  *atomic.Value // shared with Agent for GetUsage()
 }
 
 func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode string, allowedTools []string, extraEnv []string) (*claudeSession, error) {
@@ -276,12 +289,68 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
 		cs.sessionID.Store(sid)
 	}
+
+	// Extract usage snapshot from result event.
+	cs.extractUsage(raw)
+
 	evt := core.Event{Type: core.EventResult, Content: content, SessionID: cs.CurrentSessionID(), Done: true}
 	select {
 	case cs.events <- evt:
 	case <-cs.ctx.Done():
 		return
 	}
+}
+
+// extractUsage parses the usage and modelUsage fields from a result event
+// and stores the latest snapshot for GetUsage().
+func (cs *claudeSession) extractUsage(raw map[string]any) {
+	usage, _ := raw["usage"].(map[string]any)
+	if usage == nil {
+		return
+	}
+
+	su := &sessionUsage{
+		InputTokens:         toInt(usage["input_tokens"]),
+		CacheCreationTokens: toInt(usage["cache_creation_input_tokens"]),
+		CacheReadTokens:     toInt(usage["cache_read_input_tokens"]),
+		OutputTokens:        toInt(usage["output_tokens"]),
+	}
+
+	if cost, ok := raw["total_cost_usd"].(float64); ok {
+		su.TotalCostUSD = cost
+	}
+
+	// Extract model name and context window from modelUsage.
+	if mu, ok := raw["modelUsage"].(map[string]any); ok {
+		for model, info := range mu {
+			su.Model = model
+			if m, ok := info.(map[string]any); ok {
+				su.ContextWindow = toInt(m["contextWindow"])
+			}
+			break
+		}
+	}
+
+	cs.lastUsage.Store(su)
+	if cs.usageStore != nil {
+		cs.usageStore.Store(su)
+	}
+	slog.Debug("claudeSession: usage updated",
+		"input", su.InputTokens,
+		"cache_create", su.CacheCreationTokens,
+		"cache_read", su.CacheReadTokens,
+		"output", su.OutputTokens,
+		"cost", su.TotalCostUSD,
+		"context_window", su.ContextWindow,
+	)
+}
+
+// toInt converts a JSON number (float64) to int.
+func toInt(v any) int {
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
+	return 0
 }
 
 func (cs *claudeSession) handleControlRequest(raw map[string]any) {
