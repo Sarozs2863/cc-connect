@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
+	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkcontact "github.com/larksuite/oapi-sdk-go/v3/service/contact/v3"
@@ -34,8 +36,9 @@ func init() {
 }
 
 type replyContext struct {
-	messageID string
-	chatID    string
+	messageID  string
+	chatID     string
+	sessionKey string
 }
 
 type Platform struct {
@@ -50,6 +53,7 @@ type Platform struct {
 	groupReplyAll         bool
 	shareSessionInChannel bool
 	replyInThread         bool
+	threadIsolation       bool
 	client                *lark.Client
 	wsClient              *larkws.Client
 	handler               core.MessageHandler
@@ -58,6 +62,13 @@ type Platform struct {
 	dedup                 core.MessageDedup
 	botOpenID             string
 	userNameCache         sync.Map // open_id -> display name
+	chatNameCache         sync.Map // chat_id -> chat name
+	// Webhook mode fields (for Lark international version)
+	server         *http.Server
+	port           string
+	callbackPath   string
+	encryptKey     string
+	eventHandler   *dispatcher.EventDispatcher
 }
 
 type interactivePlatform struct {
@@ -90,10 +101,22 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	replyInThread, _ := opts["reply_in_thread"].(bool)
+	threadIsolation, _ := opts["thread_isolation"].(bool)
 	useInteractiveCard := true
 	if v, ok := opts["enable_feishu_card"].(bool); ok {
 		useInteractiveCard = v
 	}
+
+	// Webhook mode configuration (for Lark international version)
+	port, _ := opts["port"].(string)
+	if port == "" {
+		port = "8080"
+	}
+	callbackPath, _ := opts["callback_path"].(string)
+	if callbackPath == "" {
+		callbackPath = "/feishu/webhook"
+	}
+	encryptKey, _ := opts["encrypt_key"].(string)
 
 	var clientOpts []lark.ClientOptionFunc
 	if domain != lark.FeishuBaseUrl {
@@ -111,7 +134,11 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		groupReplyAll:         groupReplyAll,
 		shareSessionInChannel: shareSessionInChannel,
 		replyInThread:         replyInThread,
+		threadIsolation:       threadIsolation,
 		client:                lark.NewClient(appID, appSecret, clientOpts...),
+		port:                  port,
+		callbackPath:          callbackPath,
+		encryptKey:            encryptKey,
 	}
 	if !useInteractiveCard {
 		base.self = base
@@ -143,7 +170,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		slog.Info(p.platformName+": bot identified", "open_id", openID)
 	}
 
-	eventHandler := dispatcher.NewEventDispatcher("", "").
+	p.eventHandler = dispatcher.NewEventDispatcher("", p.encryptKey).
 		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
 			slog.Debug(p.platformName+": message received", "app_id", p.appID)
 			return p.onMessage(event)
@@ -169,8 +196,19 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 			return p.onCardAction(event)
 		})
 
+	// Lark international version uses Webhook mode, not WebSocket long connection
+	// Feishu domestic version supports WebSocket long connection
+	if p.platformName == "lark" {
+		return p.startWebhookMode()
+	}
+
+	return p.startWebSocketMode()
+}
+
+// startWebSocketMode starts the WebSocket long connection mode (for Feishu domestic version)
+func (p *Platform) startWebSocketMode() error {
 	wsOpts := []larkws.ClientOption{
-		larkws.WithEventHandler(eventHandler),
+		larkws.WithEventHandler(p.eventHandler),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
 	}
 	if p.domain != lark.FeishuBaseUrl {
@@ -188,6 +226,56 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	}()
 
 	return nil
+}
+
+// startWebhookMode starts the HTTP webhook server mode (for Lark international version)
+func (p *Platform) startWebhookMode() error {
+	mux := http.NewServeMux()
+	mux.HandleFunc(p.callbackPath, p.webhookHandler)
+
+	p.server = &http.Server{
+		Addr:    ":" + p.port,
+		Handler: mux,
+	}
+
+	_, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
+
+	go func() {
+		slog.Info(p.tag()+": webhook server listening", "port", p.port, "path", p.callbackPath)
+		if err := p.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error(p.tag()+": webhook server error", "error", err)
+		}
+	}()
+
+	return nil
+}
+
+// webhookHandler handles HTTP webhook requests from Lark international version
+func (p *Platform) webhookHandler(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		slog.Error(p.tag()+": read webhook body failed", "error", err)
+		http.Error(w, "read body failed", http.StatusBadRequest)
+		return
+	}
+
+	// Build EventReq from HTTP request
+	req := &larkevent.EventReq{
+		Header:     r.Header,
+		Body:       body,
+		RequestURI: r.RequestURI,
+	}
+
+	// Use the SDK's event dispatcher to handle the request
+	resp := p.eventHandler.Handle(r.Context(), req)
+
+	// Write response
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.StatusCode)
+	w.Write(resp.Body)
 }
 
 // onCardAction handles card.action.trigger callbacks via the official SDK event dispatcher.
@@ -234,7 +322,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	if chatID == "" {
 		chatID = userID
 	}
-	sessionKey := fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
+	sessionKey := p.sessionKeyFromCardAction(chatID, userID, event.Event.Action.Value)
 
 	// nav: / act: — synchronous card update
 	if strings.HasPrefix(actionVal, "nav:") || strings.HasPrefix(actionVal, "act:") {
@@ -254,7 +342,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 				return &callback.CardActionTriggerResponse{
 					Card: &callback.Card{
 						Type: "raw",
-						Data: renderCardMap(card),
+						Data: renderCardMap(card, sessionKey),
 					},
 				}, nil
 			}
@@ -281,11 +369,13 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			return nil, nil
 		}
 
-		rctx := replyContext{messageID: messageID, chatID: chatID}
+		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 		go p.handler(p.dispatchPlatform(), &core.Message{
 			SessionKey: sessionKey,
 			Platform:   p.platformName,
 			UserID:     userID,
+			UserName:   p.resolveUserName(userID),
+			ChatName:   p.resolveChatName(chatID),
 			Content:    responseText,
 			ReplyCtx:   rctx,
 		})
@@ -303,18 +393,20 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		return &callback.CardActionTriggerResponse{
 			Card: &callback.Card{
 				Type: "raw",
-				Data: renderCardMap(cb.Build()),
+				Data: renderCardMap(cb.Build(), sessionKey),
 			},
 		}, nil
 	}
 
 	// askq: — AskUserQuestion option selected, forward as user message
 	if strings.HasPrefix(actionVal, "askq:") {
-		rctx := replyContext{messageID: messageID, chatID: chatID}
+		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 		go p.handler(p.dispatchPlatform(), &core.Message{
 			SessionKey: sessionKey,
 			Platform:   p.platformName,
 			UserID:     userID,
+			UserName:   p.resolveUserName(userID),
+			ChatName:   p.resolveChatName(chatID),
 			Content:    actionVal,
 			ReplyCtx:   rctx,
 		})
@@ -332,7 +424,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		return &callback.CardActionTriggerResponse{
 			Card: &callback.Card{
 				Type: "raw",
-				Data: renderCardMap(cb.Build()),
+				Data: renderCardMap(cb.Build(), sessionKey),
 			},
 		}, nil
 	}
@@ -340,7 +432,7 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 	// cmd: — async command dispatch
 	if strings.HasPrefix(actionVal, "cmd:") {
 		cmdText := strings.TrimPrefix(actionVal, "cmd:")
-		rctx := replyContext{messageID: messageID, chatID: chatID}
+		rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 
 		slog.Info(p.tag()+": card action dispatched as command", "cmd", cmdText, "user", userID)
 
@@ -348,6 +440,8 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 			SessionKey: sessionKey,
 			Platform:   p.platformName,
 			UserID:     userID,
+			UserName:   p.resolveUserName(userID),
+			ChatName:   p.resolveChatName(chatID),
 			Content:    cmdText,
 			ReplyCtx:   rctx,
 		})
@@ -431,9 +525,10 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 	if sender.SenderId != nil && sender.SenderId.OpenId != nil {
 		userID = *sender.SenderId.OpenId
 	}
-	if sender.SenderType != nil {
-		userName = *sender.SenderType
+	if userID != "" {
+		userName = p.resolveUserName(userID)
 	}
+	chatName := p.resolveChatName(chatID)
 
 	messageID := ""
 	if msg.MessageId != nil {
@@ -459,6 +554,18 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 	if msg.ChatType != nil {
 		chatType = *msg.ChatType
 	}
+	mentionCount := len(msg.Mentions)
+	slog.Debug(p.tag()+": inbound message",
+		"message_id", messageID,
+		"chat_id", chatID,
+		"chat_type", chatType,
+		"root_id", stringValue(msg.RootId),
+		"thread_id", stringValue(msg.ThreadId),
+		"parent_id", stringValue(msg.ParentId),
+		"mentions", mentionCount,
+		"group_reply_all", p.groupReplyAll,
+		"thread_isolation", p.threadIsolation,
+	)
 
 	if chatType == "group" && !p.groupReplyAll && p.botOpenID != "" {
 		if !isBotMentioned(msg.Mentions, p.botOpenID) {
@@ -477,13 +584,13 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		return nil
 	}
 
-	var sessionKey string
-	if p.shareSessionInChannel {
-		sessionKey = fmt.Sprintf("%s:%s", p.tag(), chatID)
-	} else {
-		sessionKey = fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
-	}
-	rctx := replyContext{messageID: messageID, chatID: chatID}
+	sessionKey := p.makeSessionKey(msg, chatID, userID)
+	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	slog.Debug(p.tag()+": routed inbound message",
+		"message_id", messageID,
+		"session_key", sessionKey,
+		"reply_in_thread", p.shouldReplyInThread(rctx),
+	)
 
 	switch msgType {
 	case "text":
@@ -496,12 +603,17 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		}
 		text := stripMentions(textBody.Text, msg.Mentions, p.botOpenID)
 		if text == "" {
+			slog.Debug(p.tag()+": dropping empty text after mention stripping",
+				"message_id", messageID,
+				"raw_text_len", len(textBody.Text),
+				"mentions", mentionCount,
+			)
 			return nil
 		}
 		p.handler(p.dispatchPlatform(), &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName,
+			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content: text, ReplyCtx: rctx,
 		})
 
@@ -521,7 +633,7 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		p.handler(p.dispatchPlatform(), &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName,
+			UserID:    userID, UserName: userName, ChatName: chatName,
 			Images:   []core.ImageAttachment{{MimeType: mimeType, Data: imgData}},
 			ReplyCtx: rctx,
 		})
@@ -544,7 +656,7 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		p.handler(p.dispatchPlatform(), &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName,
+			UserID:    userID, UserName: userName, ChatName: chatName,
 			Audio: &core.AudioAttachment{
 				MimeType: "audio/opus",
 				Data:     audioData,
@@ -563,7 +675,7 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		p.handler(p.dispatchPlatform(), &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName,
+			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content: text, Images: images,
 			ReplyCtx: rctx,
 		})
@@ -588,7 +700,7 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		p.handler(p.dispatchPlatform(), &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName,
+			UserID:    userID, UserName: userName, ChatName: chatName,
 			Files: []core.FileAttachment{{
 				MimeType: mimeType,
 				Data:     fileData,
@@ -606,7 +718,7 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		coreMsg := &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName,
+			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content:  text,
 			Images:   images,
 			Files:    files,
@@ -653,6 +765,32 @@ func (p *Platform) resolveUserNames(openIDs []string) map[string]string {
 		}
 	}
 	return names
+}
+
+// resolveChatName fetches a chat/group name via the IM API, with caching.
+func (p *Platform) resolveChatName(chatID string) string {
+	if chatID == "" {
+		return ""
+	}
+	if cached, ok := p.chatNameCache.Load(chatID); ok {
+		return cached.(string)
+	}
+	resp, err := p.client.Im.Chat.Get(context.Background(),
+		larkim.NewGetChatReqBuilder().ChatId(chatID).Build())
+	if err != nil {
+		slog.Debug(p.tag()+": resolve chat name failed", "chat_id", chatID, "error", err)
+		return chatID
+	}
+	if !resp.Success() || resp.Data == nil || resp.Data.Name == nil {
+		slog.Debug(p.tag()+": resolve chat name: no data", "chat_id", chatID, "code", resp.Code)
+		return chatID
+	}
+	name := *resp.Data.Name
+	if name == "" {
+		return chatID
+	}
+	p.chatNameCache.Store(chatID, name)
+	return name
 }
 
 // parseMergeForward fetches sub-messages of a merge_forward message via the
@@ -842,10 +980,7 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 
 	resp, err := p.client.Im.Message.Reply(ctx, larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
-		Body(larkim.NewReplyMessageReqBodyBuilder().
-			MsgType(msgType).
-			Content(msgBody).
-			Build()).
+		Body(p.buildReplyMessageReqBody(rc, msgType, msgBody)).
 		Build())
 	if err != nil {
 		return fmt.Errorf("%s: reply api call: %w", p.tag(), err)
@@ -864,7 +999,7 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
 	}
 
-	if p.replyInThread && rc.messageID != "" {
+	if p.shouldReplyInThread(rc) {
 		return p.Reply(ctx, rctx, content)
 	}
 
@@ -891,6 +1026,126 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	return nil
 }
 
+func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttachment) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("%s: SendImage: invalid reply context type %T", p.tag(), rctx)
+	}
+
+	uploadResp, err := p.client.Im.Image.Create(ctx,
+		larkim.NewCreateImageReqBuilder().
+			Body(larkim.NewCreateImageReqBodyBuilder().
+				ImageType("message").
+				Image(bytes.NewReader(img.Data)).
+				Build()).
+			Build())
+	if err != nil {
+		return fmt.Errorf("%s: upload image: %w", p.tag(), err)
+	}
+	if !uploadResp.Success() {
+		return fmt.Errorf("%s: upload image code=%d msg=%s", p.tag(), uploadResp.Code, uploadResp.Msg)
+	}
+	if uploadResp.Data == nil || uploadResp.Data.ImageKey == nil {
+		return fmt.Errorf("%s: upload image: no image_key returned", p.tag())
+	}
+
+	imageContent, err := (&larkim.MessageImage{ImageKey: *uploadResp.Data.ImageKey}).String()
+	if err != nil {
+		return fmt.Errorf("%s: build image message: %w", p.tag(), err)
+	}
+
+	return p.sendMediaMessage(ctx, rc, larkim.MsgTypeImage, imageContent)
+}
+
+func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachment) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("%s: SendFile: invalid reply context type %T", p.tag(), rctx)
+	}
+
+	fileName := file.FileName
+	if fileName == "" {
+		fileName = "attachment"
+	}
+	fileType := detectFeishuFileType(file.MimeType, fileName)
+	uploadResp, err := p.client.Im.File.Create(ctx,
+		larkim.NewCreateFileReqBuilder().
+			Body(larkim.NewCreateFileReqBodyBuilder().
+				FileType(fileType).
+				FileName(fileName).
+				File(bytes.NewReader(file.Data)).
+				Build()).
+			Build())
+	if err != nil {
+		return fmt.Errorf("%s: upload file: %w", p.tag(), err)
+	}
+	if !uploadResp.Success() {
+		return fmt.Errorf("%s: upload file code=%d msg=%s", p.tag(), uploadResp.Code, uploadResp.Msg)
+	}
+	if uploadResp.Data == nil || uploadResp.Data.FileKey == nil {
+		return fmt.Errorf("%s: upload file: no file_key returned", p.tag())
+	}
+
+	fileContent, err := (&larkim.MessageFile{FileKey: *uploadResp.Data.FileKey}).String()
+	if err != nil {
+		return fmt.Errorf("%s: build file message: %w", p.tag(), err)
+	}
+
+	return p.sendMediaMessage(ctx, rc, larkim.MsgTypeFile, fileContent)
+}
+
+func (p *Platform) sendMediaMessage(ctx context.Context, rc replyContext, msgType, content string) error {
+	if p.shouldReplyInThread(rc) {
+		replyResp, err := p.client.Im.Message.Reply(ctx, larkim.NewReplyMessageReqBuilder().
+			MessageId(rc.messageID).
+			Body(p.buildReplyMessageReqBody(rc, msgType, content)).
+			Build())
+		if err != nil {
+			return fmt.Errorf("%s: send media message: %w", p.tag(), err)
+		}
+		if !replyResp.Success() {
+			return fmt.Errorf("%s: send media message code=%d msg=%s", p.tag(), replyResp.Code, replyResp.Msg)
+		}
+		return nil
+	}
+
+	sendResp, err := p.client.Im.Message.Create(ctx, larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType(larkim.ReceiveIdTypeChatId).
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(rc.chatID).
+			MsgType(msgType).
+			Content(content).
+			Build()).
+		Build())
+	if err != nil {
+		return fmt.Errorf("%s: send media message: %w", p.tag(), err)
+	}
+	if !sendResp.Success() {
+		return fmt.Errorf("%s: send media message code=%d msg=%s", p.tag(), sendResp.Code, sendResp.Msg)
+	}
+	return nil
+}
+
+func detectFeishuFileType(mimeType, fileName string) string {
+	name := strings.ToLower(fileName)
+	switch {
+	case mimeType == "application/pdf" || strings.HasSuffix(name, ".pdf"):
+		return larkim.FileTypePdf
+	case strings.HasSuffix(name, ".doc") || strings.HasSuffix(name, ".docx"):
+		return larkim.FileTypeDoc
+	case strings.HasSuffix(name, ".xls") || strings.HasSuffix(name, ".xlsx") || strings.HasSuffix(name, ".csv"):
+		return larkim.FileTypeXls
+	case strings.HasSuffix(name, ".ppt") || strings.HasSuffix(name, ".pptx"):
+		return larkim.FileTypePpt
+	case mimeType == "video/mp4" || strings.HasSuffix(name, ".mp4"):
+		return larkim.FileTypeMp4
+	case mimeType == "audio/ogg" || mimeType == "audio/opus" || strings.HasSuffix(name, ".opus"):
+		return larkim.FileTypeOpus
+	default:
+		return larkim.FileTypeStream
+	}
+}
+
 func (p *Platform) downloadImage(messageID, imageKey string) ([]byte, string, error) {
 	resp, err := p.client.Im.MessageResource.Get(context.Background(),
 		larkim.NewGetMessageResourceReqBuilder().
@@ -903,6 +1158,9 @@ func (p *Platform) downloadImage(messageID, imageKey string) ([]byte, string, er
 	}
 	if !resp.Success() {
 		return nil, "", fmt.Errorf("%s: image API code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+	}
+	if resp.File == nil {
+		return nil, "", fmt.Errorf("%s: image API returned nil file body", p.tag())
 	}
 	data, err := io.ReadAll(resp.File)
 	if err != nil {
@@ -926,6 +1184,9 @@ func (p *Platform) downloadResource(messageID, fileKey, resType string) ([]byte,
 	}
 	if !resp.Success() {
 		return nil, fmt.Errorf("%s: resource API code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+	}
+	if resp.File == nil {
+		return nil, fmt.Errorf("%s: resource API returned nil file body", p.tag())
 	}
 	data, err := io.ReadAll(resp.File)
 	if err != nil {
@@ -1309,13 +1570,98 @@ func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID strin
 	return strings.TrimSpace(text)
 }
 
+// TODO: Session-key derivation and reply-thread behavior are split across multiple code paths here.
+// Should revisit thread/root handling without changing thread_isolation=false behavior.
+func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID string) string {
+	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
+		rootID := stringValue(msg.RootId)
+		if rootID == "" {
+			rootID = stringValue(msg.MessageId)
+		}
+		if rootID != "" {
+			return fmt.Sprintf("%s:%s:root:%s", p.tag(), chatID, rootID)
+		}
+	}
+	if p.shareSessionInChannel {
+		return fmt.Sprintf("%s:%s", p.tag(), chatID)
+	}
+	return fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
+}
+
+func (p *Platform) sessionKeyFromCardAction(chatID, userID string, value map[string]any) string {
+	if value != nil {
+		if sessionKey, _ := value["session_key"].(string); sessionKey != "" {
+			return sessionKey
+		}
+	}
+	if p.shareSessionInChannel {
+		return fmt.Sprintf("%s:%s", p.tag(), chatID)
+	}
+	return fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
+}
+
+func (p *Platform) shouldReplyInThread(rc replyContext) bool {
+	if rc.messageID == "" {
+		return false
+	}
+	if p.replyInThread {
+		return true
+	}
+	return p.threadIsolation && isThreadSessionKey(rc.sessionKey)
+}
+
+func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
+	body := larkim.NewReplyMessageReqBodyBuilder().
+		MsgType(msgType).
+		Content(content)
+	if p.shouldReplyInThread(rc) {
+		body.ReplyInThread(true)
+	}
+	return body.Build()
+}
+
+func stringValue(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
 func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	// {platformName}:{chatID}:{userID}
 	parts := strings.SplitN(sessionKey, ":", 3)
 	if len(parts) < 2 || parts[0] != p.platformName {
 		return nil, fmt.Errorf("%s: invalid session key %q", p.tag(), sessionKey)
 	}
-	return replyContext{chatID: parts[1]}, nil
+	rc := replyContext{chatID: parts[1], sessionKey: sessionKey}
+	if len(parts) == 3 {
+		if rootID, ok := parseThreadRootID(parts[2]); ok {
+			rc.messageID = rootID
+		}
+	}
+	return rc, nil
+}
+
+func parseThreadRootID(sessionTail string) (string, bool) {
+	for _, prefix := range []string{"root:", "thread:"} {
+		if strings.HasPrefix(sessionTail, prefix) {
+			rootID := strings.TrimPrefix(sessionTail, prefix)
+			if rootID != "" {
+				return rootID, true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func isThreadSessionKey(sessionKey string) bool {
+	parts := strings.SplitN(sessionKey, ":", 3)
+	if len(parts) != 3 {
+		return false
+	}
+	_, ok := parseThreadRootID(parts[2])
+	return ok
 }
 
 // feishuPreviewHandle stores the message ID for an editable preview message.
@@ -1363,13 +1709,10 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	cardJSON := buildCardJSON(sanitizeMarkdownURLs(content))
 
 	var msgID string
-	if p.replyInThread && rc.messageID != "" {
+	if p.shouldReplyInThread(rc) {
 		resp, err := p.client.Im.Message.Reply(ctx, larkim.NewReplyMessageReqBuilder().
 			MessageId(rc.messageID).
-			Body(larkim.NewReplyMessageReqBodyBuilder().
-				MsgType(larkim.MsgTypeInteractive).
-				Content(cardJSON).
-				Build()).
+			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, cardJSON)).
 			Build())
 		if err != nil {
 			return nil, fmt.Errorf("%s: send preview (reply): %w", p.tag(), err)
@@ -1439,6 +1782,14 @@ func (p *Platform) Stop() error {
 	if p.cancel != nil {
 		p.cancel()
 	}
+	// Stop webhook server if running (Lark international version)
+	if p.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.server.Shutdown(ctx); err != nil {
+			slog.Error(p.tag()+": webhook server shutdown error", "error", err)
+		}
+	}
 	return nil
 }
 
@@ -1487,7 +1838,21 @@ func (p *Platform) SendAudio(ctx context.Context, rctx any, audio []byte, format
 		return fmt.Errorf("%s: build audio message: %w", p.tag(), err)
 	}
 
-	// Send audio message to chat
+	// Send audio message to chat or thread.
+	if p.shouldReplyInThread(rc) {
+		replyResp, err := p.client.Im.Message.Reply(ctx, larkim.NewReplyMessageReqBuilder().
+			MessageId(rc.messageID).
+			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeAudio, audioContent)).
+			Build())
+		if err != nil {
+			return fmt.Errorf("%s: send audio message: %w", p.tag(), err)
+		}
+		if !replyResp.Success() {
+			return fmt.Errorf("%s: send audio message code=%d msg=%s", p.tag(), replyResp.Code, replyResp.Msg)
+		}
+		return nil
+	}
+
 	sendResp, err := p.client.Im.Message.Create(ctx, larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
 		Body(larkim.NewCreateMessageReqBodyBuilder().

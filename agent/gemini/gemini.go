@@ -101,6 +101,19 @@ func normalizeMode(raw string) string {
 
 func (a *Agent) Name() string { return "gemini" }
 
+func (a *Agent) SetWorkDir(dir string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.workDir = dir
+	slog.Info("gemini: work_dir changed", "work_dir", dir)
+}
+
+func (a *Agent) GetWorkDir() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.workDir
+}
+
 func (a *Agent) SetModel(model string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -114,7 +127,19 @@ func (a *Agent) GetModel() string {
 	return a.model
 }
 
+func (a *Agent) configuredModels() []core.ModelOption {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activeIdx < 0 || a.activeIdx >= len(a.providers) {
+		return nil
+	}
+	return a.providers[a.activeIdx].Models
+}
+
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
+	if models := a.configuredModels(); len(models) > 0 {
+		return models
+	}
 	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
 		return models
 	}

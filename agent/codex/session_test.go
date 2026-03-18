@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -167,18 +168,121 @@ func TestSend_ResumeWithImages_PlacesSessionBeforeImageFlags(t *testing.T) {
 	}
 }
 
+func TestSend_HandlesLargeJSONLines(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	largeText := strings.Repeat("x", 11*1024*1024)
+	encodedText, err := json.Marshal(largeText)
+	if err != nil {
+		t.Fatalf("marshal large text: %v", err)
+	}
+
+	payload := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"thread-large"}`,
+		`{"type":"item.completed","item":{"type":"agent_message","content":[{"type":"output_text","text":` + string(encodedText) + `}]}}`,
+		`{"type":"turn.completed"}`,
+	}, "\n") + "\n"
+
+	payloadFile := filepath.Join(workDir, "payload.jsonl")
+	if err := os.WriteFile(payloadFile, []byte(payload), 0o644); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	script := "#!/bin/sh\ncat \"$CODEX_PAYLOAD_FILE\"\n"
+	scriptPath := filepath.Join(binDir, "codex")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+
+	t.Setenv("CODEX_PAYLOAD_FILE", payloadFile)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), workDir, "", "", "", "", nil)
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	if err := cs.Send("hello", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	var gotTextLen int
+	var gotResult bool
+	timeout := time.After(5 * time.Second)
+
+	for !gotResult {
+		select {
+		case evt := <-cs.Events():
+			if evt.Type == core.EventError {
+				t.Fatalf("unexpected error event: %v", evt.Error)
+			}
+			if evt.Type == core.EventText {
+				gotTextLen = len(evt.Content)
+			}
+			if evt.Type == core.EventResult && evt.Done {
+				gotResult = true
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for large JSON line events")
+		}
+	}
+
+	if gotTextLen != len(largeText) {
+		t.Fatalf("text len = %d, want %d", gotTextLen, len(largeText))
+	}
+	if got := cs.CurrentSessionID(); got != "thread-large" {
+		t.Fatalf("CurrentSessionID() = %q, want thread-large", got)
+	}
+}
+
+func TestWaitForArgsFile_WaitsForNonEmptyContent(t *testing.T) {
+	workDir := t.TempDir()
+	argsFile := filepath.Join(workDir, "args.txt")
+
+	if err := os.WriteFile(argsFile, []byte(""), 0o644); err != nil {
+		t.Fatalf("write empty args file: %v", err)
+	}
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_ = os.WriteFile(argsFile, []byte("exec\n--json\n"), 0o644)
+	}()
+
+	args := waitForArgsFile(t, argsFile)
+	if !containsSequence(args, []string{"exec", "--json"}) {
+		t.Fatalf("expected non-empty args sequence, got: %v", args)
+	}
+}
+
 func waitForArgsFile(t *testing.T, path string) []string {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(path)
 		if err == nil {
-			lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-			return lines
+			text := strings.TrimSpace(string(data))
+			if text != "" {
+				lines := strings.Split(text, "\n")
+				args := make([]string, 0, len(lines))
+				for _, line := range lines {
+					line = strings.TrimSpace(line)
+					if line != "" {
+						args = append(args, line)
+					}
+				}
+				if len(args) > 0 {
+					return args
+				}
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for args file: %s", path)
+	t.Fatalf("timed out waiting for non-empty args file: %s", path)
 	return nil
 }
 

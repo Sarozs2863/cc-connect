@@ -36,7 +36,7 @@ func init() {
 type Agent struct {
 	workDir      string
 	model        string
-	mode         string // "default" | "acceptEdits" | "plan" | "bypassPermissions"
+	mode         string // "default" | "acceptEdits" | "plan" | "bypassPermissions" | "dontAsk"
 	allowedTools []string
 	providers    []core.ProviderConfig
 	activeIdx    int // -1 = no provider set
@@ -44,8 +44,9 @@ type Agent struct {
 	routerURL    string // Claude Code Router URL (e.g., "http://127.0.0.1:3456")
 	routerAPIKey string // Claude Code Router API key (optional)
 
-	providerProxy *core.ProviderProxy // local proxy for third-party providers
-	proxyLocalURL string              // local URL of the proxy
+	providerProxy  *core.ProviderProxy // local proxy for third-party providers
+	proxyLocalURL  string              // local URL of the proxy
+	platformPrompt string              // platform-specific formatting instructions
 
 	mu sync.Mutex
 
@@ -99,6 +100,8 @@ func normalizePermissionMode(raw string) string {
 	case "bypasspermissions", "bypass-permissions", "bypass_permissions",
 		"yolo", "auto":
 		return "bypassPermissions"
+	case "dontask", "dont-ask", "dont_ask":
+		return "dontAsk"
 	default:
 		return "default"
 	}
@@ -107,6 +110,19 @@ func normalizePermissionMode(raw string) string {
 func (a *Agent) Name() string           { return "claudecode" }
 func (a *Agent) CLIBinaryName() string  { return "claude" }
 func (a *Agent) CLIDisplayName() string { return "Claude" }
+
+func (a *Agent) SetWorkDir(dir string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.workDir = dir
+	slog.Info("claudecode: work_dir changed", "work_dir", dir)
+}
+
+func (a *Agent) GetWorkDir() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.workDir
+}
 
 func (a *Agent) SetModel(model string) {
 	a.mu.Lock()
@@ -121,7 +137,19 @@ func (a *Agent) GetModel() string {
 	return a.model
 }
 
+func (a *Agent) configuredModels() []core.ModelOption {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.activeIdx < 0 || a.activeIdx >= len(a.providers) {
+		return nil
+	}
+	return a.providers[a.activeIdx].Models
+}
+
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
+	if models := a.configuredModels(); len(models) > 0 {
+		return models
+	}
 	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
 		return models
 	}
@@ -196,6 +224,12 @@ func (a *Agent) SetSessionEnv(env []string) {
 	a.sessionEnv = env
 }
 
+func (a *Agent) SetPlatformPrompt(prompt string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.platformPrompt = prompt
+}
+
 // StartSession creates a persistent interactive Claude Code session.
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.Lock()
@@ -223,9 +257,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 			model = m
 		}
 	}
+	platformPrompt := a.platformPrompt
 	a.mu.Unlock()
 
-	cs, err := newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, extraEnv)
+	cs, err := newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, extraEnv, platformPrompt)
 	if err != nil {
 		return nil, err
 	}
@@ -522,6 +557,7 @@ func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 		{Key: "acceptEdits", Name: "Accept Edits", NameZh: "接受编辑", Desc: "Auto-approve file edits, ask for others", DescZh: "自动允许文件编辑，其他需确认"},
 		{Key: "plan", Name: "Plan Mode", NameZh: "计划模式", Desc: "Plan only, no execution until approved", DescZh: "只做规划不执行，审批后再执行"},
 		{Key: "bypassPermissions", Name: "YOLO", NameZh: "YOLO 模式", Desc: "Auto-approve everything", DescZh: "全部自动通过"},
+		{Key: "dontAsk", Name: "Don't Ask", NameZh: "静默拒绝", Desc: "Auto-deny tools unless pre-approved via allowed_tools or settings.json allow rules", DescZh: "未预授权的工具自动拒绝，不弹确认"},
 	}
 }
 

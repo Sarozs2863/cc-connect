@@ -8,6 +8,14 @@ cc-connect bridges local AI coding assistants to messaging platforms (Feishu, Di
 
 GitHub: https://github.com/chenhg5/cc-connect
 
+**IMPORTANT: If you are an AI agent helping a user install cc-connect, use interactive tools (like AskUserQuestion) to guide them through configuration choices:**
+- Agent selection (Claude Code, Cursor, Gemini, etc.)
+- Platform selection (Feishu, Telegram, Discord, etc.)
+- API keys and authentication tokens
+- Project paths and preferences
+
+Don't guess values—always ask the user to choose via interactive prompts.
+
 ## Step 1: Install cc-connect
 
 ### Option A: npm (recommended for most users)
@@ -158,6 +166,28 @@ Choose one or more platforms to connect. Each platform requires creating a bot/a
 ### Feishu (Lark) — No public IP needed
 
 Connection: WebSocket long connection (SDK auto-negotiates)
+
+**CLI shortcut (recommended):**
+
+```bash
+# Recommended: unified entry
+cc-connect feishu setup --project my-project
+cc-connect feishu setup --project my-project --app cli_xxx:sec_xxx
+
+# Force modes (usually unnecessary)
+cc-connect feishu new --project my-project
+
+cc-connect feishu bind --project my-project --app cli_xxx:sec_xxx
+```
+
+Notes:
+- `setup` is the unified entry:
+  - no credentials => same as `new`
+  - with `--app`/`--app-id` => same as `bind`
+- `setup/new` prints a terminal QR code + URL for mobile scanning.
+- If `--project` does not exist, cc-connect creates it automatically.
+- This flow fills `app_id` / `app_secret`; in QR onboarding flow, Feishu usually pre-configures permissions and event subscriptions.
+- Still verify app publish status and availability scope in Feishu Open Platform.
 
 **Setup steps:**
 1. Go to https://open.feishu.cn → Console → Create Enterprise App
